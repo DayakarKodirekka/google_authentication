@@ -61,7 +61,19 @@ pub fn sensitive_config_folder_path() -> String {
 // them back to /UserAccount/login/callback with an authorization code.
 
 #[get("/UserAccount/login")]
-async fn google_login(query: web::Query<HashMap<String, String>>) -> impl Responder {
+async fn login(id: Option<Identity>, query: web::Query<HashMap<String, String>>) -> impl Responder {
+      // Check if user is already logged in
+    if let Some(identity) = id {
+        let user_email = identity.id().unwrap_or_default();
+        println!("User already logged in as: {}", user_email);
+
+        // Redirect directly to user info page
+        return HttpResponse::Found()
+            .append_header(("Location", "/UserAccount/userinfo"))
+            .finish();
+    }
+
+    // Otherwise continue to Google OAuth
     let client_id = env::var("GOOGLE_CLIENT_ID").expect("Missing GOOGLE_CLIENT_ID");
     let redirect_uri = env::var("GOOGLE_REDIRECT_URI").expect("Missing GOOGLE_REDIRECT_URI");
     let return_url = query.get("returnUrl").cloned().unwrap_or("/".to_string());
@@ -131,14 +143,12 @@ async fn google_callback(
         Identity::login(&req.extensions(), user_info.email.clone())
         .expect("Failed to create identity");
 
-        // HttpResponse::Found()
-        // .append_header(("Location", "/dashboard"))
-        // .finish();
+        // Redirect to /UserAccount/userinfo
+        let redirect_url = format!("/UserAccount/userinfo");
+         return HttpResponse::Found()
+            .append_header(("Location", redirect_url))
+            .finish();
 
-        return HttpResponse::Ok().body(format!(
-            "Welcome, {}! Your email: {}. Session created.",
-            user_info.name, user_info.email
-        ));
     }
 // If no code is provided (user declined or invalid request)
     HttpResponse::BadRequest().body("Missing code parameter")
@@ -149,10 +159,15 @@ async fn logout(id: Option<Identity>, session: Session) -> impl Responder {
     if let Some(identity) = id {
         identity.logout();
     }
-    session.clear();
-    HttpResponse::Found()
-        .append_header(("Location", "/"))
-        .finish()
+    session.clear(); // Clear all session data
+    // Redirect to /UserAccount/login
+    let html = format!(
+            "<html><body>
+            You are not logged in : 
+            <a href=\"/UserAccount/login\">Login</a>
+            </body></html>"
+        );
+        HttpResponse::Ok().content_type("text/html").body(html)
 }
 
 #[get("/UserAccount/userinfo")]
@@ -230,8 +245,9 @@ async fn main() -> std::io::Result<()> {
                 secret_key.clone(),
             ))
             // Routes
-            .service(google_login)
+            .service(login)
             .service(google_callback)
+            .service(logout)
             .service(user_infor)
             .service(authorized_sample)
             .service(Files::new("/", "./static").index_file("index.html"))
