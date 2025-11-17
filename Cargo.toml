@@ -26,3 +26,5 @@ spdlog-rs = { version = "0.4.3", features = ["source-location", "log"] }
 time = "0.3.43"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+
+base64 = "0.22"

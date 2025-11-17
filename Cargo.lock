@@ -879,6 +879,7 @@ dependencies = [
  "actix-identity",
  "actix-session",
  "actix-web",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "dotenv",

@@ -1,17 +1,14 @@
 use actix_files::Files;
 use actix_identity::{Identity, IdentityMiddleware};
-use actix_session::{storage::CookieSessionStore, Session, SessionMiddleware};
+use actix_session::{storage::CookieSessionStore, config::PersistentSession, Session, SessionMiddleware};
 use actix_web::{cookie::Key, get, web, App, HttpResponse, HttpServer, HttpRequest, Responder, HttpMessage};
 use dotenv::dotenv;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::env;
-use std::{sync::{Arc}};
-use std::fs::File;
-use std::io::BufReader;
+use std::{collections::HashMap, env, fs::File, io::BufReader, sync::Arc};
 use urlencoding::encode;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use base64::{engine::general_purpose, Engine as _};
 
 use rustls_pemfile;
 use rustls::{ServerConfig};
@@ -208,7 +205,8 @@ async fn authorized_sample(session: Session) -> impl Responder {
 async fn main() -> std::io::Result<()> {
     dotenv().ok(); // Load environment variables from .env file
 
-    let secret_key = Key::generate(); // Generate or load your encryption key
+    // let secret_key = Key::generate(); // Generate or load your encryption key
+    let secret_key =  Key::from(&general_purpose::STANDARD.decode(env::var("APP_SECRET_KEY").unwrap()).expect("Invalid APP_SECRET_KEY"),);
 
     println!("Server running at: https://127.0.0.1:8080");
     // Load certificates and keys
@@ -237,20 +235,23 @@ async fn main() -> std::io::Result<()> {
     .with_single_cert(cert_chain, priv_key)
     .expect("invalid certificate or key");
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(IdentityMiddleware::default())
-            .wrap(SessionMiddleware::new(
-                CookieSessionStore::default(),
-                secret_key.clone(),
-            ))
-            // Routes
-            .service(login)
-            .service(google_callback)
-            .service(logout)
-            .service(user_infor)
-            .service(authorized_sample)
-            .service(Files::new("/", "./static").index_file("index.html"))
+    HttpServer::new(move || {App::new()
+        .wrap(IdentityMiddleware::default()) // Enables Identity API; identity is stored inside the session.
+        .wrap(SessionMiddleware::builder(CookieSessionStore::default(), secret_key.clone()) // Uses an encrypted cookie to store the entire session.
+        .session_lifecycle(PersistentSession::default() // Makes the cookie persistent (not deleted when browser closes).
+        .session_ttl(actix_web::cookie::time::Duration::days(7))) // Session validity duration (7 days).
+        .cookie_secure(true) // Cookie is only sent over HTTPS (required for SameSite=None).
+        .cookie_http_only(true) // Cookie is not accessible from JavaScript (XSS protection).
+        .cookie_name("session".to_string()) // Name of the session cookie.
+        .cookie_same_site(actix_web::cookie::SameSite::None) // Required for Google OAuth redirects; allows cross-site cookies.
+        .cookie_domain(None)
+        .build())
+        .service(login)
+        .service(google_callback)
+        .service(logout)
+        .service(user_infor)
+        .service(authorized_sample)
+        .service(Files::new("/", "./static").index_file("index.html"))
     })
     .bind_rustls_0_23(format!("0.0.0.0:{}", 8080), tls_config)?
     .run()
