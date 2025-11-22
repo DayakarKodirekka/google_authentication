@@ -6,8 +6,12 @@ use dotenv::dotenv;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, fs::File, io::BufReader, sync::Arc};
+use std::fmt;
 use urlencoding::encode;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
+use rustls::sign::CertifiedKey;
+use rustls::crypto::aws_lc_rs::sign::any_supported_type;
 use base64::{engine::general_purpose, Engine as _};
 
 use rustls_pemfile;
@@ -49,6 +53,25 @@ pub fn sensitive_config_folder_path() -> String {
         format!("/home/{}/RQ/sensitive_data/", username) // e.g. "/home/rquser/RQ/sensitive_data/https_certs";
     }
 }
+
+// SNI (Server Name Indication): the hostname sent by the client. Used for selecting HTTPS cert.
+struct SniWithDefaultFallbackResolver {
+    inner: ResolvesServerCertUsingSni, // the main SNI resolver
+    default_ck: Arc<CertifiedKey>, // default certified key to use when no SNI match
+}
+
+impl fmt::Debug for SniWithDefaultFallbackResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SniWithDefault").finish()
+    }
+}
+
+impl ResolvesServerCert for SniWithDefaultFallbackResolver {
+    fn resolve(&self, ch: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.inner.resolve(ch).or_else(|| Some(self.default_ck.clone()))
+    }
+}
+
 
 // ================================
 //  Step 1: Redirect User to Google Login
@@ -224,22 +247,45 @@ async fn main() -> std::io::Result<()> {
     
     let sensitive_config_folder_path = sensitive_config_folder_path();
     let cert_base_path = format!("{}https_certs/", sensitive_config_folder_path);
-        // Default cert for 'localhost' and IP. Created as: openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout privkey.pem -out fullchain.pem -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,DNS:127.0.0.1"
-    let cert_chain = load_certs(&format!("{}localhost/fullchain.pem", cert_base_path));
-    let priv_key = load_private_key(&format!("{}localhost/privkey.pem", cert_base_path));
+    let theta_certs = load_certs(&format!("{}thetaconite.com/fullchain.pem", cert_base_path));
+    let theta_key = load_private_key(&format!("{}thetaconite.com/privkey.pem", cert_base_path));
+    let theta_signing_key = any_supported_type(&theta_key).expect("unsupported thetaconite private key type");
+    let theta_certified_key = CertifiedKey::new(theta_certs, theta_signing_key);
+
+    // Default cert for 'localhost' and IP. Created as: openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout privkey.pem -out fullchain.pem -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,DNS:127.0.0.1"
+    let default_certs = load_certs(&format!("{}localhost/fullchain.pem", cert_base_path));
+    let default_key = load_private_key(&format!("{}localhost/privkey.pem", cert_base_path));
+    let default_signing_key = any_supported_type(&default_key).expect("unsupported default key");
+    let default_certified_key = CertifiedKey::new(default_certs, default_signing_key);
+
+     // the SNI (Server Name Indication) hostname sent by the client
+    // ResolvesServerCertUsingSni matches DNS hostnames, not IPs, and SNI itself is defined for hostnames (not addresses). 
+    // So IP 127.0.0.1 won’t ever hit an entry in that resolver. We need a SniWithDefaultFallbackResolver to provide a default cert for IP connections.
+    let mut sni_resolver = ResolvesServerCertUsingSni::new();
+    // sni_resolver.add("rqcore.com", rq_certified_key.clone()).expect("Invalid DNS name for rqcore.com");
+    // sni_resolver.add("www.rqcore.com", rq_certified_key.clone()).expect("Invalid DNS name for www.rqcore.com");
+    sni_resolver.add("thetaconite.com", theta_certified_key.clone()).expect("Invalid DNS name for thetaconite.com");
+    sni_resolver.add("localhost", default_certified_key.clone()).expect("Invalid localhost DNS name"); // default cert for localhost and IP e.g. 127.0.0.1
+
+    let cert_resolver = Arc::new(SniWithDefaultFallbackResolver {
+        inner: sni_resolver,
+        default_ck: Arc::new(default_certified_key.clone()), // use the default (for 'localhost') for IP connections when no domain name sent by client
+    });
 
     let tls_config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(cert_chain, priv_key)
-    .expect("invalid certificate or key");
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(cert_resolver);
 
+    // Curl Test
+    // curl -v --resolve thetaconite.com:8080:127.0.0.1 --cookie "session=PASTE_YOUR_COOKIE_HERE" --insecure https://thetaconite.com:8080/UserAccount/userinfo
+    // curl -v --resolve localhost:8080:127.0.0.1 --cookie "session=PASTE_YOUR_COOKIE_HERE" --insecure https://localhost:8080/UserAccount/userinfo
     HttpServer::new(move || {App::new()
         .wrap(IdentityMiddleware::default()) // Enables Identity API; identity is stored inside the session.
         .wrap(SessionMiddleware::builder(CookieSessionStore::default(), secret_key.clone()) // Uses an encrypted cookie to store the entire session.
         .session_lifecycle(PersistentSession::default() // Makes the cookie persistent (not deleted when browser closes).
-        .session_ttl(actix_web::cookie::time::Duration::days(7))) // Session validity duration (7 days).
+        .session_ttl(actix_web::cookie::time::Duration::days(365))) // Session validity duration (365 days).
         .cookie_secure(true) // Cookie is only sent over HTTPS (required for SameSite=None).
         .cookie_http_only(true) // Cookie is not accessible from JavaScript (XSS protection).
         .cookie_name("session".to_string()) // Name of the session cookie.
