@@ -7,6 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, fs::File, io::BufReader, sync::Arc};
 use std::fmt;
+use std::path::Path;
 use urlencoding::encode;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
@@ -82,14 +83,12 @@ impl ResolvesServerCert for SniWithDefaultFallbackResolver {
 
 #[get("/UserAccount/login")]
 async fn login(id: Option<Identity>, query: web::Query<HashMap<String, String>>) -> impl Responder {
-      // Check if user is already logged in
-    if let Some(identity) = id {
-        let user_email = identity.id().unwrap_or_default();
-        println!("User already logged in as: {}", user_email);
 
-        // Redirect directly to user info page
+    // If user is already loggedin redirect to returnUrl or home
+    if let Some(_id) = id {
+        let return_url = query.get("returnUrl").cloned().unwrap_or("/".to_string());
         return HttpResponse::Found()
-            .append_header(("Location", "/UserAccount/userinfo"))
+            .append_header(("Location", return_url))
             .finish();
     }
 
@@ -163,9 +162,14 @@ async fn google_callback(
         Identity::login(&req.extensions(), user_info.email.clone())
         .expect("Failed to create identity");
 
-        // Redirect to /UserAccount/userinfo
-        let redirect_url = format!("/UserAccount/userinfo");
-         return HttpResponse::Found()
+        let mut redirect_url = "/".to_string();
+        // check if the query contains a "state" key
+        if let Some(encoded) = query.get("state") {
+            if let Ok(decoded) = urlencoding::decode(encoded) {
+                redirect_url = decoded.into_owned(); //store the redirect target
+            }
+        }
+        return HttpResponse::Found()
             .append_header(("Location", redirect_url))
             .finish();
 
@@ -224,6 +228,42 @@ async fn authorized_sample(session: Session) -> impl Responder {
     HttpResponse::Unauthorized().body("You are not logged in.")
 }
 
+// Custom root handler that serves different index based on login state
+#[get("/")]
+async fn root_index(id: Option<Identity>, session: Session) -> impl Responder {
+    // check if user is logged in
+    let is_logged_in = id.as_ref().is_some_and(|i| i.id().is_ok());
+    // 1. Choose which file to serve
+    let filename = if is_logged_in { "index.html" } else { "index_nouser.html" };
+    let file_path = Path::new("./static").join(filename);
+
+    // 2. Read the file content
+    let mut html = match std::fs::read_to_string(&file_path) {
+        Ok(content) => content,
+        Err(_) => return HttpResponse::NotFound().body("File not found"),
+    };
+
+    // 3. If user is logged in give email + logout link
+    if id.is_some() {
+        if let Ok(Some(email)) = session.get::<String>("user_email") {
+            let user_email = html_escape::encode_text(&email);
+
+            let user_info_html = format!(
+                r#"<div style="margin:20px 0; font-weight:bold; color:#2c3e50;">
+                    {user_email} | <a href="/UserAccount/logout">Logout</a>
+                   </div>"#
+            );
+
+            html = html.replace("</body>", &format!("{user_info_html}\n</body>")); // Insert before </body>
+        }
+    }
+
+    // 4. Serve the modified HTML
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv().ok(); // Load environment variables from .env file
@@ -231,7 +271,7 @@ async fn main() -> std::io::Result<()> {
     // let secret_key = Key::generate(); // Generate or load your encryption key
     let secret_key =  Key::from(&general_purpose::STANDARD.decode(env::var("APP_SECRET_KEY").unwrap()).expect("Invalid APP_SECRET_KEY"),);
 
-    println!("Server running at: https://127.0.0.1:8080");
+    println!("Server running at: https://localhost:8080");
     // Load certificates and keys
     fn load_certs(filename: &str) -> Vec<CertificateDer<'static>> {
         let certfile = File::open(filename).expect(&format!("cannot open certificate file {}", filename));
@@ -297,7 +337,9 @@ async fn main() -> std::io::Result<()> {
         .service(logout)
         .service(user_infor)
         .service(authorized_sample)
-        .service(Files::new("/", "./static").index_file("index.html"))
+        .service(root_index)
+        // .service(Files::new("/", "./static").index_file("index.html"))
+        .service(Files::new("/", "./static").show_files_listing().use_last_modified(true))
     })
     .bind_rustls_0_23(format!("0.0.0.0:{}", 8080), tls_config)?
     .run()
