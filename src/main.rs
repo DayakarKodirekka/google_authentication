@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, fs::File, io::BufReader, sync::Arc};
 use std::fmt;
 use std::path::Path;
+use chrono::Utc;
 use urlencoding::encode;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
@@ -115,7 +116,7 @@ async fn login(id: Option<Identity>, query: web::Query<HashMap<String, String>>)
 
 #[get("/UserAccount/login/callback")]
 async fn google_callback(
-     req: HttpRequest,                     // Used for Identity::login()
+    req: HttpRequest,                     // Used for Identity::login()
     query: web::Query<HashMap<String, String>>, // Extract "code" query param
     session: Session,                     // Used to store session data
 ) -> impl Responder {
@@ -264,6 +265,20 @@ async fn root_index(id: Option<Identity>, session: Session) -> impl Responder {
         .body(html)
 }
 
+#[get("/WebServer/Ping")]
+async fn webserver_ping() -> impl Responder {
+    // Get current UTC timestamp formatted like: 2025-11-25 14:52:120
+    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let html = format!(
+        "<html><body>Ping. Webserver UtcNow: {}</body></html>",
+        timestamp
+    );
+
+    HttpResponse::Ok()
+        .content_type("text/html")
+        .body(html)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv().ok(); // Load environment variables from .env file
@@ -337,6 +352,7 @@ async fn main() -> std::io::Result<()> {
         .service(logout)
         .service(user_infor)
         .service(authorized_sample)
+        .service(webserver_ping)
         .service(root_index)
         // .service(Files::new("/", "./static").index_file("index.html"))
         .service(Files::new("/", "./static").show_files_listing().use_last_modified(true))
